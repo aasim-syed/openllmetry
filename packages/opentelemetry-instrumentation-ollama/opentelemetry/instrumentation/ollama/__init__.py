@@ -87,6 +87,60 @@ def _sanitize_copy_messages(wrapped, instance, args, kwargs):
     return wrapped(sanitized)
 
 
+def _end_span(span):
+    # close()/aclose() and the generator's own cleanup can both reach this
+    if span.is_recording():
+        span.end()
+
+
+class _StreamingResponse:
+    """Sync stream wrapper that ends the span and closes the source on close().
+
+    A generator closed before its first next() never runs its body, so the
+    cleanup in _accumulate_streaming_response would be skipped entirely.
+    """
+
+    def __init__(self, generator, span, response):
+        self._generator = generator
+        self._span = span
+        self._response = response
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._generator)
+
+    def close(self):
+        self._generator.close()
+        _end_span(self._span)
+        close = getattr(self._response, "close", None)
+        if close:
+            close()
+
+
+class _AsyncStreamingResponse:
+    """Async counterpart of _StreamingResponse."""
+
+    def __init__(self, generator, span, response):
+        self._generator = generator
+        self._span = span
+        self._response = response
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        return await self._generator.__anext__()
+
+    async def aclose(self):
+        await self._generator.aclose()
+        _end_span(self._span)
+        aclose = getattr(self._response, "aclose", None)
+        if aclose:
+            await aclose()
+
+
 def _accumulate_streaming_response(
     span,
     event_logger,
@@ -155,7 +209,7 @@ def _accumulate_streaming_response(
             response=response_data | accumulated_response,
         )
     finally:
-        span.end()
+        _end_span(span)
 
 
 async def _aaccumulate_streaming_response(
@@ -226,7 +280,7 @@ async def _aaccumulate_streaming_response(
             response_data | accumulated_response,
         )
     finally:
-        span.end()
+        _end_span(span)
 
 
 def _with_tracer_wrapper(func):
@@ -351,15 +405,19 @@ def _wrap(
             duration_histogram.record(duration, attributes=attrs)
 
         if kwargs.get("stream"):
-            return _accumulate_streaming_response(
+            return _StreamingResponse(
+                _accumulate_streaming_response(
+                    span,
+                    event_logger,
+                    token_histogram,
+                    llm_request_type,
+                    response,
+                    streaming_time_to_first_token,
+                    streaming_time_to_generate,
+                    start_time,
+                ),
                 span,
-                event_logger,
-                token_histogram,
-                llm_request_type,
                 response,
-                streaming_time_to_first_token,
-                streaming_time_to_generate,
-                start_time,
             )
 
         _handle_response(
@@ -432,15 +490,19 @@ async def _awrap(
             duration_histogram.record(duration, attributes=attrs)
 
         if kwargs.get("stream"):
-            return _aaccumulate_streaming_response(
+            return _AsyncStreamingResponse(
+                _aaccumulate_streaming_response(
+                    span,
+                    event_logger,
+                    token_histogram,
+                    llm_request_type,
+                    response,
+                    streaming_time_to_first_token,
+                    streaming_time_to_generate,
+                    start_time,
+                ),
                 span,
-                event_logger,
-                token_histogram,
-                llm_request_type,
                 response,
-                streaming_time_to_first_token,
-                streaming_time_to_generate,
-                start_time,
             )
 
         _handle_response(
